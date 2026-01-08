@@ -1,53 +1,36 @@
 import streamlit as st
-import json
-import os
+from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 
 # --- CONFIGURATION ---
-DB_FILE = 'database.json'
 ADMIN_PASSWORD = "admin123"
 APPS = ["Music Player", "YouTube Music", "YouTube Video", "Sim Voice", "Messenger", "Whatsapp", "IMO"]
 CRIT_NAMES = []
 for name in APPS:
     CRIT_NAMES.extend([f"{name} (Max)", f"{name} (Min)"])
 
-# --- DATABASE LOGIC ---
-def load_db():
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, 'r') as f:
-            return json.load(f)
-    return {"products": [], "user_data": {}}
+st.set_page_config(page_title="Acoustic Insights", layout="wide")
 
-def save_db(data):
-    with open(DB_FILE, 'w') as f:
-        json.dump(data, f, indent=4)
+# --- DATABASE CONNECTION ---
+conn = st.connection("gsheets", type=GSheetsConnection)
 
-# --- SESSION STATE ---
+# --- NAVIGATION ---
 if "view" not in st.session_state: st.session_state.view = "home"
 if "logged_in" not in st.session_state: st.session_state.logged_in = False
 
-# --- UI STYLING ---
-st.markdown("""
-    <style>
-    .main { background-color: #121212; }
-    .stButton>button { width: 100%; border-radius: 5px; height: 3em; background-color: #27ae60; color: white; }
-    .instruction-box { background-color: #1e1e1e; padding: 20px; border: 1px solid #f1c40f; border-radius: 10px; }
-    </style>
-    """, unsafe_allow_html=True)
-
-# --- NAVIGATION ---
 if st.session_state.view != "home":
-    if st.button("← Back to Home"):
+    if st.sidebar.button("← Back to Home"):
         st.session_state.view = "home"
         st.rerun()
 
 # --- HOME VIEW ---
 if st.session_state.view == "home":
     st.title("Acoustic Insights 🎧")
+    st.write("Professional Audio Performance Analytics")
     
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Admin Panel"):
+        if st.button("Admin Panel", use_container_width=True):
             pw = st.text_input("Enter Admin Key", type="password")
             if pw == ADMIN_PASSWORD:
                 st.session_state.logged_in = True
@@ -56,78 +39,81 @@ if st.session_state.view == "home":
             elif pw: st.error("Invalid Key")
             
     with col2:
-        if st.button("User Panel"):
+        if st.button("User Panel", use_container_width=True):
             st.session_state.view = "user"
             st.rerun()
-
-    with st.expander("📖 How to Rate? (Instructions)"):
-        st.markdown("""
-        * Select the **Model** you are testing.
-        * Enter your **Name** and **ID**.
-        * More stars = Better performance.
-        * Submit once all 14 ratings are done.
-        """)
 
 # --- USER VIEW ---
 elif st.session_state.view == "user":
     st.header("User Rating Panel")
-    db = load_db()
     
-    col_name, col_id = st.columns(2)
-    u_name = col_name.text_input("Full Name")
-    u_id = col_id.text_input("Employee ID")
-    product = st.selectbox("Select Model", [""] + db["products"])
+    # Load Models from "Models" sheet
+    models_df = conn.read(worksheet="Models", ttl=0)
+    model_list = models_df["Model Name"].tolist() if not models_df.empty else []
     
-    if u_name and u_id and product != "":
+    with st.expander("Step 1: Identity", expanded=True):
+        u_name = st.text_input("Full Name")
+        u_id = st.text_input("Employee ID")
+        selected_model = st.selectbox("Select Model for Testing", [""] + model_list)
+    
+    if u_name and u_id and selected_model:
+        st.write("### Step 2: Rate Performance (1-5 Stars)")
         scores = []
         for crit in CRIT_NAMES:
-            val = st.feedback("stars", key=crit) # Streamlit's built-in star rating
-            if val is None: val = 0 
-            else: val += 1 # feedback starts at 0
+            score = st.feedback("stars", key=crit)
+            val = (score + 1) if score is not None else 0
             scores.append(val)
-            st.write(f"Rating for {crit}: {val}")
-
-        if st.button("Submit All Ratings"):
+        
+        if st.button("Submit All Ratings", type="primary"):
             if 0 in scores:
                 st.warning("Please provide a rating for all 14 criteria.")
             else:
-                db["user_data"].setdefault(product, {})[u_id] = {"name": u_name, "scores": scores}
-                save_db(db)
-                st.success(f"Submitted! Your Avg: {round(sum(scores)/14, 2)}")
+                # Prepare data to append
+                new_data = pd.DataFrame([{
+                    "User Name": u_name,
+                    "Employee ID": u_id,
+                    "Model": selected_model,
+                    **dict(zip(CRIT_NAMES, scores))
+                }])
+                
+                # Update "Ratings" sheet
+                existing_ratings = conn.read(worksheet="Ratings", ttl=0)
+                updated_ratings = pd.concat([existing_ratings, new_data], ignore_index=True)
+                conn.update(worksheet="Ratings", data=updated_ratings)
+                
+                st.success(f"Successfully submitted! Average Score: {round(sum(scores)/14, 2)}")
                 st.balloons()
-    else:
-        st.info("Enter your Name, ID, and Select a Model to start rating.")
 
 # --- ADMIN VIEW ---
 elif st.session_state.view == "admin":
     st.header("Admin Control Center")
-    db = load_db()
-
-    tab1, tab2 = st.tabs(["Dashboard", "Manage Models"])
+    tab1, tab2 = st.tabs(["📊 Analytics", "⚙️ Manage Models"])
     
     with tab1:
-        target = st.selectbox("View Results for:", [""] + db["products"])
-        if target and target in db["user_data"]:
-            users = db["user_data"][target]
-            # Calculate Averages
-            rows = []
-            for uid, info in users.items():
-                rows.append([info["name"]] + info["scores"])
+        ratings_df = conn.read(worksheet="Ratings", ttl=0)
+        if not ratings_df.empty:
+            st.write("### All User Submissions")
+            st.dataframe(ratings_df)
             
-            df = pd.DataFrame(rows, columns=["User"] + CRIT_NAMES)
-            st.write("### Raw Data")
-            st.dataframe(df)
+            target = st.selectbox("Filter by Model", ["All"] + ratings_df["Model"].unique().tolist())
+            filtered = ratings_df if target == "All" else ratings_df[ratings_df["Model"] == target]
             
-            st.write("### Category Averages")
-            avg_series = df.drop(columns="User").mean()
-            st.bar_chart(avg_series)
-            
+            if not filtered.empty:
+                st.write(f"### Average Ratings for {target}")
+                avgs = filtered[CRIT_NAMES].mean()
+                st.bar_chart(avgs)
+        else:
+            st.info("No ratings found in the database yet.")
+
     with tab2:
-        new_m = st.text_input("Model Name")
-        new_v = st.text_input("SW Version")
-        if st.button("Add Model"):
-            entry = f"{new_m} (SW: {new_v})"
-            if entry not in db["products"]:
-                db["products"].append(entry)
-                save_db(db)
+        st.write("### Add New Device")
+        new_m = st.text_input("Model Name (e.g., S24)")
+        new_v = st.text_input("SW Version (e.g., v1.0)")
+        if st.button("Register Model"):
+            if new_m and new_v:
+                models_df = conn.read(worksheet="Models", ttl=0)
+                new_entry = pd.DataFrame([{"Model Name": f"{new_m} (SW: {new_v})"}])
+                updated_models = pd.concat([models_df, new_entry], ignore_index=True)
+                conn.update(worksheet="Models", data=updated_models)
+                st.success("Model Registered!")
                 st.rerun()
